@@ -1,0 +1,430 @@
+diff --git a/libfprint/drivers/fpcmoc/fpc.c b/libfprint/drivers/fpcmoc/fpc.c
+index 466a809..9a411b3 100644
+--- a/libfprint/drivers/fpcmoc/fpc.c
++++ b/libfprint/drivers/fpcmoc/fpc.c
+@@ -40,6 +40,8 @@ struct _FpiDeviceFpcMoc
+   gint          max_immobile_stage;
+   gint          max_stored_prints;
+   guint         cmd_data_timeout;
++  guint16       product_id;
++  gboolean      is_9924;
+   guint8       *dbid;
+   gboolean      do_cleanup;
+   GCancellable *interrupt_cancellable;
+@@ -73,6 +75,7 @@ static const FpIdEntry id_table[] = {
+   { .vid = 0x10A5,  .pid = 0x9544,  },
+   { .vid = 0x10A5,  .pid = 0xC844,  },
+   { .vid = 0x10A5,  .pid = 0x9B24,  },
++  { .vid = 0x10A5,  .pid = 0x9924,  },
+   /* terminating entry */
+   { .vid = 0,  .pid = 0,  .driver_data = 0 },
+ };
+@@ -524,10 +527,28 @@ fpc_template_delete_cb (FpiDeviceFpcMoc *self,
+ }
+ 
+ static gboolean
+-parse_print_data (GVariant      *data,
+-                  guint8        *finger,
+-                  const guint8 **user_id,
+-                  gsize         *user_id_len)
++fpc_identity_matches (FpiDeviceFpcMoc *self,
++                      guint8           subfactor,
++                      guint32          identity_type,
++                      gsize            identity_size)
++{
++  if (self->is_9924)
++    return (subfactor == FPC_SUBTYPE_RESERVED &&
++            identity_type == 2 &&
++            identity_size == 16);
++
++  return (subfactor == FPC_SUBTYPE_RESERVED &&
++          identity_type == FPC_IDENTITY_TYPE_RESERVED &&
++          identity_size > 0 &&
++          identity_size <= SECURITY_MAX_SID_SIZE);
++}
++
++static gboolean
++parse_print_data (FpiDeviceFpcMoc *self,
++                  GVariant        *data,
++                  guint8          *finger,
++                  const guint8   **user_id,
++                  gsize           *user_id_len)
+ {
+   g_autoptr(GVariant) user_id_var = NULL;
+ 
+@@ -553,8 +574,16 @@ parse_print_data (GVariant      *data,
+   if (*user_id_len == 0 || *user_id_len > SECURITY_MAX_SID_SIZE)
+     return FALSE;
+ 
+-  if (*user_id_len <= 0 || *user_id[0] == '\0' || *user_id[0] == ' ')
+-    return FALSE;
++  if (self->is_9924)
++    {
++      if (*user_id_len != 16)
++        return FALSE;
++    }
++  else
++    {
++      if (*user_id[0] == '\0' || *user_id[0] == ' ')
++        return FALSE;
++    }
+ 
+   if (*finger != FPC_SUBTYPE_RESERVED)
+     return FALSE;
+@@ -574,8 +603,23 @@ fpc_print_from_data (FpiDeviceFpcMoc *self, fpc_fid_data_t *fid_data)
+   GVariant *data;
+   GVariant *uid;
+   g_autofree gchar *userid = NULL;
++  g_autofree gchar *hex_identity = NULL;
++
++  if (self->is_9924 || fid_data->identity_type == 2)
++    {
++      GString *builder = g_string_sized_new (fid_data->identity_size * 2 + 1);
++
++      for (gsize i = 0; i < fid_data->identity_size; i++)
++        g_string_append_printf (builder, "%02x", fid_data->identity[i]);
++
++      hex_identity = g_string_free (builder, FALSE);
++      userid = g_strdup (hex_identity);
++    }
++  else
++    {
++      userid = g_strndup ((gchar *) fid_data->identity, fid_data->identity_size);
++    }
+ 
+-  userid = g_strndup ((gchar *) fid_data->identity, fid_data->identity_size);
+   print = fp_print_new (FP_DEVICE (self));
+ 
+   uid = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+@@ -656,8 +700,10 @@ fpc_template_list_cb (FpiDeviceFpcMoc *self,
+       FpPrint *print = NULL;
+       fpc_fid_data_t *fid_data = &presp->evt_enum_fids.fid_data[n];
+ 
+-      if ((fid_data->subfactor != FPC_SUBTYPE_RESERVED) &&
+-          (fid_data->identity_type != FPC_IDENTITY_TYPE_RESERVED))
++      if (!fpc_identity_matches (self,
++                                 fid_data->subfactor,
++                                 fid_data->identity_type,
++                                 fid_data->identity_size))
+         {
+           fp_info ("Incompatible template found (0x%x, 0x%x)",
+                    fid_data->subfactor, fid_data->identity_type);
+@@ -868,9 +914,11 @@ fpc_enroll_check_duplicate_cb (FpiDeviceFpcMoc *self,
+   if (check_data (data, &error))
+     {
+       presp = (FPC_IDENTIFY *) data;
+-      if ((presp->status == 0) && (presp->subfactor == FPC_SUBTYPE_RESERVED) &&
+-          (presp->identity_type == FPC_IDENTITY_TYPE_RESERVED) &&
+-          (presp->identity_size <= SECURITY_MAX_SID_SIZE))
++      if ((presp->status == 0) &&
++          fpc_identity_matches (self,
++                                presp->subfactor,
++                                presp->identity_type,
++                                presp->identity_size))
+         {
+           fp_info ("%s Got a duplicated template", G_STRFUNC);
+           error = fpi_device_error_new (FP_DEVICE_ERROR_DATA_DUPLICATE);
+@@ -1070,20 +1118,43 @@ fpc_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
+         GVariant *fpi_data = NULL;
+         GVariant *uid = NULL;
+         guint finger = FPC_SUBTYPE_RESERVED;
+-        g_autofree gchar *user_id = NULL;
+-        gssize user_id_len;
++        guint32 identity_type = FPC_IDENTITY_TYPE_RESERVED;
++        guint8 identity_raw[SECURITY_MAX_SID_SIZE] = {0};
++        gsize identity_raw_len = 0;
++        g_autofree gchar *description = NULL;
+         g_autofree guint8 *payload = NULL;
+ 
+         fpi_device_get_enroll_data (device, &print);
+ 
+-        user_id = fpi_print_generate_user_id (print);
++        if (self->is_9924)
++          {
++            g_autoptr(GString) hex_id = g_string_sized_new (33);
++
++            identity_type = 2;
++            identity_raw_len = 16;
++            for (gsize i = 0; i < identity_raw_len; i++)
++              identity_raw[i] = (guint8) g_random_int_range (0, 256);
++
++            for (gsize i = 0; i < identity_raw_len; i++)
++              g_string_append_printf (hex_id, "%02x", identity_raw[i]);
+ 
+-        user_id_len = strlen (user_id);
+-        user_id_len = MIN (SECURITY_MAX_SID_SIZE, user_id_len);
++            description = g_string_free (g_steal_pointer (&hex_id), FALSE);
++          }
++        else
++          {
++            g_autofree gchar *user_id = NULL;
++            gsize user_id_len = 0;
++
++            user_id = fpi_print_generate_user_id (print);
++            user_id_len = MIN ((gsize) SECURITY_MAX_SID_SIZE, strlen (user_id));
++            memcpy (identity_raw, user_id, user_id_len);
++            identity_raw_len = user_id_len;
++            description = g_strdup (user_id);
++          }
+ 
+         uid = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+-                                         user_id,
+-                                         user_id_len,
++                                         identity_raw,
++                                         identity_raw_len,
+                                          1);
+         fpi_data = g_variant_new ("(y@ay)",
+                                   finger,
+@@ -1092,17 +1163,16 @@ fpc_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
+         fpi_print_set_type (print, FPI_PRINT_RAW);
+         fpi_print_set_device_stored (print, TRUE);
+         g_object_set (print, "fpi-data", fpi_data, NULL);
+-        g_object_set (print, "description", user_id, NULL);
++        g_object_set (print, "description", description, NULL);
+ 
+-        fp_dbg ("user_id: %s, finger: 0x%x", user_id, finger);
++        fp_dbg ("identity: %s, finger: 0x%x", description, finger);
+ 
+         data_len = sizeof (FPC_FID_DATA);
+-        data.identity_type = FPC_IDENTITY_TYPE_RESERVED;
++        data.identity_type = identity_type;
+         data.reserved = 16;
+-        data.identity_size = user_id_len;
++        data.identity_size = identity_raw_len;
+         data.subfactor = (guint32) finger;
+-        memcpy (&data.data[0],
+-                user_id, user_id_len);
++        memcpy (&data.data[0], identity_raw, identity_raw_len);
+ 
+         cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE;
+         cmd_data.request = FPC_CMD_BIND_IDENTITY;
+@@ -1217,9 +1287,11 @@ fpc_verify_cb (FpiDeviceFpcMoc *self,
+   g_assert (current_action == FPI_DEVICE_ACTION_VERIFY ||
+             current_action == FPI_DEVICE_ACTION_IDENTIFY);
+ 
+-  if ((presp->status == 0) && (presp->subfactor == FPC_SUBTYPE_RESERVED) &&
+-      (presp->identity_type == FPC_IDENTITY_TYPE_RESERVED) &&
+-      (presp->identity_size <= SECURITY_MAX_SID_SIZE))
++  if ((presp->status == 0) &&
++      fpc_identity_matches (self,
++                            presp->subfactor,
++                            presp->identity_type,
++                            presp->identity_size))
+     {
+       FpPrint *match = NULL;
+       FpPrint *print = NULL;
+@@ -1478,6 +1550,48 @@ fpc_clear_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+  *
+  *****************************************************************************/
+ 
++static void
++fpc_init_step_done_cb (FpiDeviceFpcMoc *self,
++                       void            *data,
++                       GError          *error)
++{
++  if (error)
++    {
++      fp_err ("%s error: %s", G_STRFUNC, error->message);
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  fpi_ssm_next_state (self->task_ssm);
++}
++
++static void
++fpc_init_auth_blob_cb (FpiDeviceFpcMoc *self,
++                       void            *data,
++                       GError          *error)
++{
++  gint32 status = 0;
++
++  if (!check_data (data, &error))
++    {
++      fp_err ("%s error: %s ", G_STRFUNC, error->message);
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  status = *((gint32 *) data);
++  if (status != 0)
++    {
++      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                        "Session auth blob failed: %d",
++                                        status);
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  fpi_ssm_next_state (self->task_ssm);
++}
++
+ static void
+ fpc_init_load_db_cb (FpiDeviceFpcMoc *self,
+                      void            *data,
+@@ -1533,12 +1647,41 @@ static void
+ fpc_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
+ {
+   FpiDeviceFpcMoc *self = FPI_DEVICE_FPCMOC (device);
+-  guint32 session_id = FPC_SESSIONID_RESERVED;
++  guint32 session_id = self->is_9924 ? g_random_int () : FPC_SESSIONID_RESERVED;
+   CommandData cmd_data = {0};
+ 
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+     case FPC_INIT:
++      if (self->is_9924)
++        {
++          cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE;
++          cmd_data.request = FPC_CMD_INDICATE_S_STATE;
++          cmd_data.value = FPC_HOST_MS_S0;
++          cmd_data.index = 0x0;
++          cmd_data.data = NULL;
++          cmd_data.data_len = 0;
++          cmd_data.callback = fpc_init_step_done_cb;
++        }
++      else
++        {
++          cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE_EVTDATA;
++          cmd_data.request = FPC_CMD_INIT;
++          cmd_data.value = 0x1;
++          cmd_data.index = 0x0;
++          cmd_data.data = (guint8 *) &session_id;
++          cmd_data.data_len = sizeof (session_id);
++          cmd_data.callback = fpc_evt_cb;
++        }
++      fpc_sensor_cmd (self, FALSE, &cmd_data);
++      break;
++
++    case FPC_INIT_SESSION_PREPARE:
++      if (!self->is_9924)
++        {
++          fpi_ssm_jump_to_state (ssm, FPC_INIT_LOAD_DB);
++          break;
++        }
+       cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE_EVTDATA;
+       cmd_data.request = FPC_CMD_INIT;
+       cmd_data.value = 0x1;
+@@ -1546,7 +1689,54 @@ fpc_init_sm_run_state (FpiSsm *ssm, FpDevice *device)
+       cmd_data.data = (guint8 *) &session_id;
+       cmd_data.data_len = sizeof (session_id);
+       cmd_data.callback = fpc_evt_cb;
++      fpc_sensor_cmd (self, FALSE, &cmd_data);
++      break;
++
++    case FPC_INIT_SESSION_AUTH_BLOB:
++      if (!self->is_9924)
++        {
++          fpi_ssm_jump_to_state (ssm, FPC_INIT_LOAD_DB);
++          break;
++        }
++      cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE;
++      cmd_data.request = FPC_CMD_SESSION_PREPARE;
++      cmd_data.value = 0x0;
++      cmd_data.index = 0x0;
++      cmd_data.data = NULL;
++      cmd_data.data_len = 0;
++      cmd_data.callback = fpc_init_step_done_cb;
++      fpc_sensor_cmd (self, FALSE, &cmd_data);
++      break;
+ 
++    case FPC_INIT_SESSION_AUTH_VERIFY:
++      if (!self->is_9924)
++        {
++          fpi_ssm_jump_to_state (ssm, FPC_INIT_LOAD_DB);
++          break;
++        }
++      cmd_data.cmdtype = FPC_CMDTYPE_FROM_DEVICE;
++      cmd_data.request = FPC_CMD_SESSION_AUTH_BLOB;
++      cmd_data.value = 0xF5DC;
++      cmd_data.index = 0x0;
++      cmd_data.data = NULL;
++      cmd_data.data_len = 68;
++      cmd_data.callback = fpc_init_auth_blob_cb;
++      fpc_sensor_cmd (self, FALSE, &cmd_data);
++      break;
++
++    case FPC_INIT_SESSION_ARM:
++      if (!self->is_9924)
++        {
++          fpi_ssm_jump_to_state (ssm, FPC_INIT_LOAD_DB);
++          break;
++        }
++      cmd_data.cmdtype = FPC_CMDTYPE_TO_DEVICE;
++      cmd_data.request = FPC_CMD_SESSION_ARM;
++      cmd_data.value = 0x1;
++      cmd_data.index = 0x0;
++      cmd_data.data = NULL;
++      cmd_data.data_len = 0;
++      cmd_data.callback = fpc_init_step_done_cb;
+       fpc_sensor_cmd (self, FALSE, &cmd_data);
+       break;
+ 
+@@ -1635,6 +1825,8 @@ fpc_dev_probe (FpDevice *device)
+     }
+ 
+   product_id = g_usb_device_get_pid (usb_dev);
++  self->product_id = product_id;
++  self->is_9924 = (product_id == 0x9924);
+   /* Reserved for customer enroll scheme */
+   self->max_immobile_stage = 0;   /* By default is not customer enrollment */
+   switch (product_id)
+@@ -1648,6 +1840,7 @@ fpc_dev_probe (FpDevice *device)
+     case 0x9524:
+     case 0x9544:
+     case 0xC844:
++    case 0x9924:
+       self->max_enroll_stage = MAX_ENROLL_SAMPLES;
+       break;
+ 
+@@ -1836,7 +2029,7 @@ fpc_dev_template_delete (FpDevice *device)
+ 
+   g_object_get (print, "fpi-data", &fpi_data, NULL);
+ 
+-  if (!parse_print_data (fpi_data, &finger, &user_id, &user_id_len))
++  if (!parse_print_data (self, fpi_data, &finger, &user_id, &user_id_len))
+     {
+       fpi_device_delete_complete (device,
+                                   fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
+@@ -1844,7 +2037,7 @@ fpc_dev_template_delete (FpDevice *device)
+     }
+ 
+   data_len = sizeof (FPC_FID_DATA);
+-  data.identity_type = FPC_IDENTITY_TYPE_RESERVED;
++  data.identity_type = self->is_9924 ? 2 : FPC_IDENTITY_TYPE_RESERVED;
+   data.reserved = 16;
+   data.identity_size = user_id_len;
+   data.subfactor = (guint32) finger;
+diff --git a/libfprint/drivers/fpcmoc/fpc.h b/libfprint/drivers/fpcmoc/fpc.h
+index 70d6432..52be1cf 100644
+--- a/libfprint/drivers/fpcmoc/fpc.h
++++ b/libfprint/drivers/fpcmoc/fpc.h
+@@ -29,6 +29,9 @@
+ #define FPC_CMD_INIT (0x01)
+ #define FPC_CMD_ARM (0x02)
+ #define FPC_CMD_ABORT (0x03)
++#define FPC_CMD_GET_STATE (0x0B)
++#define FPC_CMD_SESSION_PREPARE (0x12)
++#define FPC_CMD_SESSION_AUTH_BLOB (0x14)
+ #define FPC_CMD_INDICATE_S_STATE (0x08)
+ #define FPC_CMD_GET_IMG (0x09)
+ #define FPC_CMD_GET_KPI (0x0C)
+@@ -42,6 +45,7 @@
+ #define FPC_CMD_BIND_IDENTITY (0x6A)
+ #define FPC_CMD_IDENTIFY (0x6B)
+ #define FPC_CMD_ENUM (0x70)
++#define FPC_CMD_SESSION_ARM (0x90)
+ #define FPC_EVT_INIT_RESULT (0x02)
+ #define FPC_EVT_FINGER_DWN (0x06)
+ #define FPC_EVT_IMG (0x08)
+@@ -187,6 +191,10 @@ typedef enum {
+ 
+ typedef enum {
+   FPC_INIT = 0,
++  FPC_INIT_SESSION_PREPARE,
++  FPC_INIT_SESSION_AUTH_BLOB,
++  FPC_INIT_SESSION_AUTH_VERIFY,
++  FPC_INIT_SESSION_ARM,
+   FPC_INIT_LOAD_DB,
+   FPC_INIT_NUM_STATES,
+ } FpcInitState;

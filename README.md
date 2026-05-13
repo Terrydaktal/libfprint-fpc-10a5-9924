@@ -1,6 +1,6 @@
-# fpc9924-libfprint-patched
+# libfprint-fpc-10a5-9924
 
-Patched `libfprint` workflow for Fingerprint Cards sensor `10a5:9924` (Honor MagicBook path), in the same delivery style as packaged/patched driver repos.
+Patched `libfprint` workflow for Fingerprint Cards sensor `10a5:9924`, specifically for the Honor MagicBook 14 Pro (2025), in the same delivery style as packaged/patched driver repos.
 
 This repo contains:
 - a patch against upstream `libfprint` (`fpcmoc`) for experimental `10a5:9924` support
@@ -9,7 +9,7 @@ This repo contains:
 ## Project Structure
 
 ```text
-fpc9924-libfprint-patched/
+libfprint-fpc-10a5-9924/
 ├── patches/
 │   └── 0001-fpcmoc-add-10a5-9924-experimental-support.patch
 ├── scripts/
@@ -32,53 +32,54 @@ fpc9924-libfprint-patched/
 - Enables type-2 identity handling (`16-byte binary identity`) for list/enroll/identify/delete on 9924.
 - Keeps legacy behavior for existing `fpcmoc` devices.
 
-## Prerequisites
-
-On Debian/Ubuntu/Mint (example packages):
+## Install
 
 ```bash
+# 1. Install build deps
 sudo apt-get update
 sudo apt-get install -y \
   git meson ninja-build pkg-config build-essential \
   libglib2.0-dev libgusb-dev libudev-dev libnss3-dev \
   libcairo2-dev libpam0g-dev libdbus-1-dev gtk-doc-tools
-```
 
-## Usage
+# 2. Clone this patch repo
+git clone https://github.com/Terrydaktal/libfprint-fpc-10a5-9924.git
+cd libfprint-fpc-10a5-9924
 
-### 1) Apply patch to a fresh `libfprint` checkout
+# 3. Clone upstream libfprint source
+git clone --depth 1 https://gitlab.freedesktop.org/libfprint/libfprint.git ./libfprint-9924
 
-```bash
-./scripts/apply-patch.sh /path/to/libfprint
-```
+# 4. Apply this repo's patch to upstream libfprint
+./scripts/apply-patch.sh ./libfprint-9924
 
-### 2) Build + install patched libfprint
+# 5. Build and install patched libfprint
+./scripts/build-install.sh ./libfprint-9924
 
-```bash
-./scripts/build-install.sh /path/to/libfprint
-```
+# 6. Restart fprintd
+sudo systemctl restart fprintd
 
-### 3) Smoke test with fprintd
-
-```bash
-./scripts/smoke-test.sh
-```
-
-## Validation Flow
-
-After install:
-
-```bash
-fprintd-enroll "$USER"
+# 7. Enroll and verify
+fprintd-enroll -f right-index-finger "$USER"
 fprintd-list "$USER"
-fprintd-verify "$USER"
+fprintd-verify -f right-index-finger "$USER"
 ```
 
-To clear one print via desktop stack:
+Delete behavior in `fprintd`:
 
 ```bash
+# delete all enrolled fingerprints for the user
 fprintd-delete "$USER"
+
+# delete a single enrolled finger
+fprintd-delete "$USER" -f right-index-finger
 ```
+
+## Security / TLS Status
+
+- Windows uses additional secure-auth/TLS-related plumbing (notably around `0x64/0x65/0x6C/0x6D`) in the vendor stack.
+- This patch targets a working Linux `libfprint`/`fprintd` flow (enroll/list/verify/delete) for `10a5:9924` and does not claim full Windows secure-auth parity.
+- The implemented path includes the required session/auth initialization (`0x12` + `0x14` + `0x90`) and is validated functionally on target hardware.
+- If full vendor-secure parity is required, deeper reverse engineering of the Windows secure-auth key/handshake flow is still needed.
 
 ## Notes
 

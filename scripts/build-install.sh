@@ -52,7 +52,7 @@ sudo ldconfig
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 
-if systemctl list-unit-files | rg -q '^fprintd\.service'; then
+if systemctl list-unit-files | grep -q '^fprintd\.service'; then
 	sudo systemctl restart fprintd
 fi
 

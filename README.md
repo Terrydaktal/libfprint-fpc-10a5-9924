@@ -38,9 +38,11 @@ libfprint-fpc-10a5-9924/
 # 1. Install build deps
 sudo apt-get update
 sudo apt-get install -y \
-  git meson ninja-build pkg-config build-essential \
+  git meson ninja-build cmake pkg-config build-essential \
   libglib2.0-dev libgusb-dev libudev-dev libnss3-dev \
-  libcairo2-dev libpam0g-dev libdbus-1-dev gtk-doc-tools
+  libcairo2-dev libpam0g-dev libdbus-1-dev libsystemd-dev \
+  libssl-dev libgirepository1.0-dev gobject-introspection \
+  gtk-doc-tools
 
 # 2. Clone this patch repo
 git clone https://github.com/Terrydaktal/libfprint-fpc-10a5-9924.git

@@ -66,6 +66,23 @@ fprintd-list "$USER"
 fprintd-verify -f right-index-finger "$USER"
 ```
 
+Fedora 44 dependencies:
+
+```bash
+sudo dnf install -y \
+  git meson ninja-build pkgconf-pkg-config \
+  gcc gcc-c++ make \
+  glib2-devel libgusb-devel systemd-devel nss-devel \
+  cairo-devel pam-devel dbus-devel gtk-doc pixman-devel \
+  cmake openssl-devel gobject-introspection-devel
+```
+
+Fedora build/install behavior:
+
+- `scripts/build-install.sh` now sets explicit Meson `--prefix` and `--libdir`.
+- On Fedora, defaults are `--prefix=/usr` and `--libdir=lib64`.
+- You can override them with `MESON_PREFIX` and `MESON_LIBDIR`.
+
 Delete behavior in `fprintd`:
 
 ```bash
